@@ -256,11 +256,13 @@ class GraphiTEncoder(nn.Module):
         # 输入投影
         h = self.input_proj(x)
 
-        # 位置编码
+        # 位置编码 (纯粹的节点级标识)
         pos_ids = torch.arange(num_nodes, device=device)
-        h = h + self.pos_encoder(pos_ids)
+        h_init = h + self.pos_encoder(pos_ids)  # <--- 【修改点：保存干净的节点身份特征】
 
-        # 度编码
+        h = h_init  # 继续后续的图结构运算
+
+
         if edge_index.numel() > 0:
             row, col = edge_index
             deg = degree(row, num_nodes, dtype=torch.long)
@@ -273,40 +275,27 @@ class GraphiTEncoder(nn.Module):
         centrality = self.compute_centrality(edge_index, num_nodes)
         h = h + self.centrality_encoder(centrality)
 
-        # 应用GraphiT层
+        # 应用GraphiT层 (消息传递，最严重的泄露源)
         for layer in self.layers:
             h = layer(h, edge_index)
 
-        # 保存节点表示
-        node_embeddings = h
-
-        # 多尺度读出
+        # 多尺度读出 (计算全局特征 h_global 的逻辑不变)
         if h.dim() == 2:
-            # 平均池化
             h_mean = h.mean(dim=0, keepdim=True)
-
-            # 最大池化
             h_max = h.max(dim=0, keepdim=True)[0]
-
-            # 加权池化（基于中心性）
             weights = F.softmax(centrality.squeeze(), dim=0)
             h_weighted = (h * weights.unsqueeze(-1)).sum(dim=0, keepdim=True)
-
-            # 组合
             h_global = torch.cat([h_mean, h_max, h_weighted], dim=-1)
             h_global = self.readout_mlp(h_global)
         else:
-            # 批处理情况
             h_global = h.mean(dim=1)
 
-        # 生成VAE参数
         mean = self.mean_proj(h_global)
         logvar = self.logvar_proj(h_global)
-
-        # 限制logvar范围
         logvar = torch.clamp(logvar, min=-10, max=2)
 
-        return node_embeddings, mean, logvar
+
+        return h_init, mean, logvar
 
 
 # ========== 唯一重要的改动：优化解码器（去除双重for循环）==========
@@ -401,14 +390,14 @@ class GraphiTVAE(nn.Module):
         return mean + eps * std
 
     def forward(self, x, edge_index, num_nodes):
-        # 编码
-        node_embeddings, mean, logvar = self.encoder(x, edge_index)
+        # 编码: 拿到安全的初始特征 h_init
+        h_init, mean, logvar = self.encoder(x, edge_index)
 
         # 重参数化
         z = self.reparameterize(mean, logvar)
 
         # 解码
-        adj_recon = self.decoder(z, node_embeddings, num_nodes)
+        adj_recon = self.decoder(z, h_init, num_nodes)
 
         return adj_recon, mean, logvar, z
 
